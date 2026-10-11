@@ -458,10 +458,21 @@ def download_inbound_media(mid, idx, kind, item, sub, log):
         media = find_media_ref(item, sub)
         if not media:
             return {"kind": kind, "error": "消息里没有媒体下载引用"}
+        # 失败可重试：媒体引用存进 state/media_refs/（state/ 不进仓库，引用不落 inbox）
+        try:
+            os.makedirs(os.path.join(STATE_DIR, "media_refs"), exist_ok=True)
+            atomic_write_json(os.path.join(STATE_DIR, "media_refs", f"{mid}.json"),
+                              {"kind": kind, "media": media,
+                               "aeskey": (sub or {}).get("aeskey")})
+        except Exception:
+            pass
         url = media.get("full_url")
         if not url:
             url = (CDN_BASE + "/download?encrypted_query_param="
                    + urllib.parse.quote(str(media["encrypt_query_param"]), safe=""))
+        log(f"[in] 媒体下载尝试 mid={mid} kind={kind} "
+            f"host={urllib.parse.urlparse(url).netloc} "
+            f"via={'full_url' if media.get('full_url') else 'cdn_param'}")
         data = http_get_bytes(url)
         # 密钥优先级：image_item.aeskey（十六进制）> media.aes_key（base64）；都没有则明文
         key = None
@@ -476,6 +487,10 @@ def download_inbound_media(mid, idx, kind, item, sub, log):
         if key:
             data = aes_ecb_decrypt(data, key)
         ext = sniff_ext(data)
+        try:
+            os.remove(os.path.join(STATE_DIR, "media_refs", f"{mid}.json"))
+        except OSError:
+            pass
         name = f"{mid}-{idx}.{ext}"
         tmp = os.path.join(MEDIA_DIR, name + ".tmp")
         with open(tmp, "wb") as f:
