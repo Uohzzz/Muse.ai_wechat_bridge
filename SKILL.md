@@ -74,6 +74,7 @@ python3 bridge.py status   # serve: 运行中
 - **收消息**：`POST /ilink/bot/getupdates`，带 `Authorization: Bearer <bot_token>`、`get_updates_buf` 游标（要持久化，重启后续传）和 `base_info`，超时 45 秒。只处理 `ilink_user_id` 本人发来的消息；`group_id` 非空的群消息忽略；语音消息带转写文本时按文本处理，纯图片/视频/文件写入 inbox 并标记类型。
 - **发消息（字段错了不报错但发不出去）**：`sendmessage` 的 `msg` 里 `from_user_id` 必须传空字符串 `""`、`client_id` 每次随机唯一、`message_type=2`、`message_state=2`、`context_token` 原样回传用户那条消息里的值；顶层必须带 `base_info{channel_version, bot_agent}`。
 - **-14 处理**：`ret`/`errcode` 为 `-14` 时先暂停 5 分钟重试一次（可能是限流而非过期）；仍失败才判 token 死亡：token **没有 refresh 机制**，在 `state/` 写 `NEEDS_RELOGIN` 标记，等用户重新扫码；看门狗负责通知（只通知一次，重新登录成功后标记自动清除、下次过期再通知）。
+- **防重复回复（两个闸口，缺一不可）**：worker 把消息 ID 记入 `processed.json` 是在回复生成**之后**，而 hook 每 15 秒轮询一次——只要一次回复生成超过 15 秒（如需要联网查资料），下一轮轮询就会把同一条消息再唤醒一个 worker，两个 worker 各写一份同名 pending，serve 依次发出，用户就会收到两条内容不同的回复。因此：①轮询脚本唤醒前先把待处理 ID 写入 `state/claimed.json`（带时间戳，10 分钟过期防 worker 中途死亡导致消息永久丢失），已 claim 的不再唤醒；②serve 发送侧按 `message_id` 去重：成功发送后把 ID 与时间写入 `state/sent_ids.json`，1 小时窗口内同 ID 的 pending 文件直接跳过并归档。`scripts/wechat-inbox-watch.sh` 与 `scripts/bridge.py` 已内置这两道闸口。
 
 ## 安全红线
 

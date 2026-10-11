@@ -38,6 +38,8 @@ SESSION_FILE = os.path.join(STATE_DIR, "session.json")
 PENDING_QR_FILE = os.path.join(STATE_DIR, "pending_qrcode.json")
 CURSOR_FILE = os.path.join(STATE_DIR, "get_updates_buf.txt")
 LAST_CONTEXT_FILE = os.path.join(STATE_DIR, "last_context.json")
+SENT_IDS_FILE = os.path.join(STATE_DIR, "sent_ids.json")
+DEDUPE_WINDOW_SEC = 3600  # 同一 message_id 在此窗口内只发送一次，防重复回复
 PID_FILE = os.path.join(STATE_DIR, "serve.pid")
 NEEDS_RELOGIN_FILE = os.path.join(STATE_DIR, "NEEDS_RELOGIN")
 NOTIFIED_RELOGIN_FILE = os.path.join(STATE_DIR, "notified_relogin")
@@ -446,6 +448,15 @@ def flush_outbox(session, log, attempts):
             log(f"[out] 跳过无效文件 {name}")
             os.replace(path, os.path.join(OUTBOX_FAILED, name))
             continue
+        # 去重闸口：同一 message_id 在窗口内已成功发送过，就不再发第二遍
+        # （防上游重复唤醒 worker 生成两条回复、写同名 pending 文件）
+        mid = str(data.get("message_id") or name[:-5])
+        sent_ids = read_json(SENT_IDS_FILE) or {}
+        last_sent = sent_ids.get(mid)
+        if isinstance(last_sent, (int, float)) and time.time() - last_sent < DEDUPE_WINDOW_SEC:
+            log(f"[out] 跳过重复发送 {name}（message_id {mid} 已发送过）")
+            os.replace(path, os.path.join(OUTBOX_SENT, name))
+            continue
         to_user = data.get("to_user_id") or session.get("ilink_user_id")
         try:
             resp = send_with_relogin_handling(session, to_user, data["text"],
@@ -463,6 +474,10 @@ def flush_outbox(session, log, attempts):
         if code in (0, None):
             os.replace(path, os.path.join(OUTBOX_SENT, name))
             attempts.pop(name, None)
+            sent_ids[mid] = time.time()
+            pruned = {k: v for k, v in sent_ids.items()
+                      if isinstance(v, (int, float)) and time.time() - v < 86400}
+            atomic_write_text(SENT_IDS_FILE, json.dumps(pruned, ensure_ascii=False))
             log(f"[out] 已发送 {name} -> {mask(to_user)}")
         else:
             attempts[name] = attempts.get(name, 0) + 1
