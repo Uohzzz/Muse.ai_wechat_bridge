@@ -19,6 +19,7 @@ import json
 import os
 import random
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -34,6 +35,8 @@ INBOX_DIR = os.path.join(BASE_DIR, "inbox")
 OUTBOX_PENDING = os.path.join(BASE_DIR, "outbox", "pending")
 OUTBOX_SENT = os.path.join(BASE_DIR, "outbox", "sent")
 OUTBOX_FAILED = os.path.join(BASE_DIR, "outbox", "failed")
+MEDIA_DIR = os.path.join(INBOX_DIR, "media")
+CDN_BASE = "https://novac2c.cdn.weixin.qq.com/c2c"
 SESSION_FILE = os.path.join(STATE_DIR, "session.json")
 PENDING_QR_FILE = os.path.join(STATE_DIR, "pending_qrcode.json")
 CURSOR_FILE = os.path.join(STATE_DIR, "get_updates_buf.txt")
@@ -67,7 +70,7 @@ def now_iso():
 
 
 def ensure_dirs():
-    for d in (STATE_DIR, INBOX_DIR, OUTBOX_PENDING, OUTBOX_SENT, OUTBOX_FAILED):
+    for d in (STATE_DIR, INBOX_DIR, MEDIA_DIR, OUTBOX_PENDING, OUTBOX_SENT, OUTBOX_FAILED):
         os.makedirs(d, exist_ok=True)
 
 
@@ -363,6 +366,128 @@ class ServeLog:
                 pass
 
 
+def http_get_bytes(url, timeout=30):
+    """带重试 + 断点续传的二进制 GET：微信 CDN 偶发中途断流（IncompleteRead），
+    用 Range 请求把剩余部分续拉回来，最多 6 轮。"""
+    buf = b""
+    total = None
+    last_exc = None
+    for attempt in range(6):
+        try:
+            headers = {"Range": f"bytes={len(buf)}-"} if buf else {}
+            req = urllib.request.Request(url, headers=headers, method="GET")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if buf and resp.status == 200:
+                    buf = b""  # 服务器忽略了 Range，从头来
+                clen = resp.headers.get("Content-Length")
+                if clen is not None:
+                    total = len(buf) + int(clen)
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+            if total is None or len(buf) >= total:
+                return buf
+            last_exc = BridgeError(f"下载不完整：已收 {len(buf)}/{total} 字节")
+        except http.client.IncompleteRead as e:
+            if e.partial:
+                buf += e.partial
+            last_exc = e
+        except Exception as e:
+            last_exc = e
+        if attempt < 5:
+            time.sleep((1, 2, 2, 3, 3)[attempt])
+    raise BridgeError(f"媒体下载多次仍失败: {last_exc}")
+
+
+def decode_media_key(aes_key_b64):
+    """media.aes_key 是 base64：解开后或为 16 字节原始密钥，或为 32 位十六进制字符串。"""
+    if not aes_key_b64:
+        return None
+    try:
+        raw = base64.b64decode(aes_key_b64)
+    except Exception:
+        return None
+    if len(raw) == 16:
+        return raw
+    if len(raw) == 32:
+        try:
+            return bytes.fromhex(raw.decode("ascii"))
+        except Exception:
+            return None
+    return None
+
+
+def aes_ecb_decrypt(data, key):
+    """AES-128-ECB + PKCS#7 解密，借系统 openssl 实现（保持 bridge 只依赖标准库）。"""
+    proc = subprocess.run(
+        ["openssl", "enc", "-d", "-aes-128-ecb", "-K", key.hex()],
+        input=data, capture_output=True, timeout=30)
+    if proc.returncode != 0:
+        raise BridgeError("openssl 解密失败: "
+                          + proc.stderr.decode("utf-8", "replace")[:120])
+    return proc.stdout
+
+
+def sniff_ext(data):
+    if data[:3] == b"\xff\xd8\xff":
+        return "jpg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    if data[4:8] == b"ftyp" and data[8:12] in (b"heic", b"heix", b"mif1"):
+        return "heic"
+    return "bin"
+
+
+def find_media_ref(item, sub):
+    """在 item / 子对象里找 CDN 媒体引用（含 encrypt_query_param 或 full_url 的字典）。"""
+    for cand in ((sub or {}).get("media"), item.get("media"), sub or {}):
+        if isinstance(cand, dict) and (cand.get("encrypt_query_param") or cand.get("full_url")):
+            return cand
+    return None
+
+
+def download_inbound_media(mid, idx, kind, item, sub, log):
+    """下载并解密一条入站媒体（图片/视频/文件）。成功返回 {kind, path, size}，失败返回 {kind, error}。"""
+    try:
+        media = find_media_ref(item, sub)
+        if not media:
+            return {"kind": kind, "error": "消息里没有媒体下载引用"}
+        url = media.get("full_url")
+        if not url:
+            url = (CDN_BASE + "/download?encrypted_query_param="
+                   + urllib.parse.quote(str(media["encrypt_query_param"]), safe=""))
+        data = http_get_bytes(url)
+        # 密钥优先级：image_item.aeskey（十六进制）> media.aes_key（base64）；都没有则明文
+        key = None
+        aeskey_hex = (sub or {}).get("aeskey")
+        if isinstance(aeskey_hex, str) and len(aeskey_hex) == 32:
+            try:
+                key = bytes.fromhex(aeskey_hex)
+            except Exception:
+                key = None
+        if key is None:
+            key = decode_media_key(media.get("aes_key"))
+        if key:
+            data = aes_ecb_decrypt(data, key)
+        ext = sniff_ext(data)
+        name = f"{mid}-{idx}.{ext}"
+        tmp = os.path.join(MEDIA_DIR, name + ".tmp")
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, os.path.join(MEDIA_DIR, name))
+        log(f"[in] 媒体已下载 {name}（{kind}，{len(data)} 字节）")
+        return {"kind": kind, "path": f"media/{name}", "size": len(data)}
+    except Exception as e:
+        log(f"[in] 媒体下载失败 mid={mid} kind={kind}: {e}")
+        return {"kind": kind, "error": str(e)[:200]}
+
+
 def process_incoming(session, msg, log):
     """把一条入站消息写入 inbox/。返回 True 表示已处理（写入或明确忽略）。"""
     if msg.get("group_id"):
@@ -378,6 +503,7 @@ def process_incoming(session, msg, log):
     items = msg.get("item_list") or []
     text_parts = []
     media_types = []
+    media_jobs = []
     for it in items:
         t = it.get("type")
         if t == 1:
@@ -393,10 +519,13 @@ def process_incoming(session, msg, log):
                 media_types.append("voice")
         elif t == 2:
             media_types.append("image")
+            media_jobs.append(("image", it, it.get("image_item") or {}))
         elif t == 5:
             media_types.append("video")
+            media_jobs.append(("video", it, it.get("video_item") or {}))
         elif t == 4:
             media_types.append("file")
+            media_jobs.append(("file", it, it.get("file_item") or {}))
         else:
             media_types.append(f"type{t}")
     text = "\n".join(text_parts) if text_parts else None
@@ -408,6 +537,14 @@ def process_incoming(session, msg, log):
         kind = "unknown"
     message_id = msg.get("message_id")
     mid = str(message_id) if message_id is not None else f"{msg.get('create_time_ms')}_{msg.get('seq')}"
+    media_files = []
+    media_errors = []
+    for idx, (mkind, it, sub) in enumerate(media_jobs):
+        r = download_inbound_media(mid, idx, mkind, it, sub, log)
+        if "path" in r:
+            media_files.append(r)
+        else:
+            media_errors.append(r)
     record = {
         "message_id": mid,
         "seq": msg.get("seq"),
@@ -420,6 +557,10 @@ def process_incoming(session, msg, log):
         "create_time_ms": msg.get("create_time_ms"),
         "received_at": now_iso(),
     }
+    if media_files:
+        record["media_files"] = media_files
+    if media_errors:
+        record["media_errors"] = media_errors
     path = os.path.join(INBOX_DIR, f"{mid}.json")
     if not os.path.exists(path):
         atomic_write_json(path, record)
