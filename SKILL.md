@@ -1,7 +1,7 @@
 ---
 name: "wechat_ilink_bridge"
 title: "微信 iLink Bot 桥"
-description: "把 AI 助手接入用户微信：走微信官方 iLink / Clawbot Bot 通道（ilinkai.weixin.qq.com），扫码登录后实现一对一私聊的收发、自动回复与健康看门狗。包含 bridge.py（仅 Python 标准库 + qrcode）、inbox/outbox 文件队列、10 秒自动回复 hook 与纯脚本看门狗 hook（健康时零唤醒、零 token）的完整部署流程。"
+description: "把 AI 助手接入用户微信：走微信官方 iLink / Clawbot Bot 通道（ilinkai.weixin.qq.com），扫码登录后实现一对一私聊的收发、自动回复与健康看门狗。包含 bridge.py（仅 Python 标准库 + qrcode）、inbox/outbox 文件队列、5 秒自动回复 hook 与纯脚本看门狗 hook（健康时零唤醒、零 token）的完整部署流程。"
 ---
 
 # 微信 iLink Bot 桥
@@ -11,7 +11,7 @@ description: "把 AI 助手接入用户微信：走微信官方 iLink / Clawbot 
 ## 架构
 
 - `bridge.py serve` 常驻进程：用 `getupdates` 长轮询收消息 → 写入 `inbox/`（JSON 文件队列）；把 `outbox/pending/` 里的回复用 `sendmessage` 发出 → 移到 `outbox/sent/`。
-- 自动回复 hook（每 10 秒轮询 `inbox/`）：发现未处理消息就唤醒一个 worker 按助手口吻生成回复、写入 `outbox/pending/`，serve 负责真正发送。
+- 自动回复 hook（每 5 秒轮询 `inbox/`）：发现未处理消息就唤醒一个 worker 按助手口吻生成回复、写入 `outbox/pending/`，serve 负责真正发送。
 - 看门狗 hook（纯脚本，每 5 分钟）：脚本直接检查 serve 存活并自动拉起、处理登录失效标记，健康时 silent 不唤醒任何 agent（零 token）；只有拉起成功/失败或登录失效时才唤醒通知 worker 给用户发一条消息（登录失效只通知一次）。收件箱轮询发现新消息时顺带刷新 `state/last_activity.json`（用户最后活跃时间），供闲置判断使用。
 - 所有状态都在安装目录的 `state/` 下，其中 `session.json` 是登录凭据。
 
@@ -60,7 +60,7 @@ python3 bridge.py status   # serve: 运行中
 
 1. 把 `scripts/wechat-inbox-watch.sh` 放到 `~/hooks/scripts/`（脚本比较 `inbox/` 与 `state/processed.json`，有未处理消息才 wake）。
 2. **启用前先把当时 inbox 里已有的消息 ID 全部写入 `state/processed.json`（JSON 数组）**，避免重复回复手动测试过的消息。
-3. 用 hook 工具创建 hook：轮询间隔 10 秒，worker 指令用 `templates/hook-prompt.md` 的内容。先 dry-run（预期 silent 或只报已知消息），再 enable。
+3. 用 hook 工具创建 hook：轮询间隔 5 秒，worker 指令用 `templates/hook-prompt.md` 的内容。先 dry-run（预期 silent 或只报已知消息），再 enable。
 
 ### 6. 配置看门狗 hook（纯脚本版，不要用 cron）
 
@@ -78,7 +78,7 @@ python3 bridge.py status   # serve: 运行中
 - **入站媒体下载**：图片/视频/文件消息带 CDN 媒体引用（`media{encrypt_query_param, aes_key, full_url}`，可能挂在 item 或子对象上，要多处找）。下载优先用 `full_url`，否则拼 `<CDN 基址>/download?encrypted_query_param=<URL 编码>`（默认基址 `https://novac2c.cdn.weixin.qq.com/c2c`）。解密为 AES-128-ECB + PKCS#7：密钥优先级 `image_item.aeskey`（32 位十六进制字符串）> `media.aes_key`（base64，解开后或为 16 字节原始密钥、或为 32 位十六进制字符串的 ASCII）；两者都没有则下载内容即明文。Python 标准库没有 AES，`bridge.py` 借系统 `openssl enc -d -aes-128-ecb -K <hex>` 解密（需系统有 openssl）。下载成功落 `inbox/media/<message_id>-<序号>.<按魔数判定的扩展名>`，路径记入 inbox JSON 的 `media_files`；失败记 `media_errors`，消息本体照常入 inbox。下载前先把媒体引用存一份到 `state/media_refs/<message_id>.json`（成功后删除）——CDN 偶发抽风（中途断流、连接被关）时可以拿存底引用重试，不必让用户重发；下载走 Range 断点续传，不要每次从头拉。有了 `media_files`，自动回复 worker 对纯图片回「收到，我看看，马上回你。」并把路径转主对话看图后正式回复；没有（下载失败）才回「这条我看不了图片」。
 - **发消息（字段错了不报错但发不出去）**：`sendmessage` 的 `msg` 里 `from_user_id` 必须传空字符串 `""`、`client_id` 每次随机唯一、`message_type=2`、`message_state=2`、`context_token` 原样回传用户那条消息里的值；顶层必须带 `base_info{channel_version, bot_agent}`。
 - **-14 处理**：`ret`/`errcode` 为 `-14` 时先暂停 5 分钟重试一次（可能是限流而非过期）；仍失败才判 token 死亡：token **没有 refresh 机制**，在 `state/` 写 `NEEDS_RELOGIN` 标记，等用户重新扫码；看门狗负责通知（只通知一次，重新登录成功后标记自动清除、下次过期再通知）。
-- **防重复回复（两个闸口，缺一不可）**：worker 把消息 ID 记入 `processed.json` 是在回复生成**之后**，而 hook 每 10 秒轮询一次——只要一次回复生成超过 10 秒（如需要联网查资料），下一轮轮询就会把同一条消息再唤醒一个 worker，两个 worker 各写一份同名 pending，serve 依次发出，用户就会收到两条内容不同的回复。因此：①轮询脚本唤醒前先把待处理 ID 写入 `state/claimed.json`（带时间戳，10 分钟过期防 worker 中途死亡导致消息永久丢失），已 claim 的不再唤醒；②serve 发送侧按 `message_id` 去重：成功发送后把 ID 与时间写入 `state/sent_ids.json`，1 小时窗口内同 ID 的 pending 文件直接跳过并归档。`scripts/wechat-inbox-watch.sh` 与 `scripts/bridge.py` 已内置这两道闸口。
+- **防重复回复（两个闸口，缺一不可）**：worker 把消息 ID 记入 `processed.json` 是在回复生成**之后**，而 hook 每 5 秒轮询一次——只要一次回复生成超过 5 秒（如需要联网查资料），下一轮轮询就会把同一条消息再唤醒一个 worker，两个 worker 各写一份同名 pending，serve 依次发出，用户就会收到两条内容不同的回复。因此：①轮询脚本唤醒前先把待处理 ID 写入 `state/claimed.json`（带时间戳，10 分钟过期防 worker 中途死亡导致消息永久丢失），已 claim 的不再唤醒；②serve 发送侧按 `message_id` 去重：成功发送后把 ID 与时间写入 `state/sent_ids.json`，1 小时窗口内同 ID 的 pending 文件直接跳过并归档。`scripts/wechat-inbox-watch.sh` 与 `scripts/bridge.py` 已内置这两道闸口。
 
 ## 安全红线
 
