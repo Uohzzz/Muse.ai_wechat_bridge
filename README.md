@@ -8,7 +8,7 @@
 
 - 📩 **收发打通**：你在微信里给 Bot 发消息，助手实时收到；助手的回复自动发回微信，手机不需要 VPN，微信正常联网即可
 - 🤖 **自动回复**：每 15 秒检查新消息，多条连发合并成一条回复（200 字内，不刷屏）；图片/文件会礼貌请你打字；复杂问题先答“收到，我记下了”再转人工跟进
-- 🛡️ **自愈**：看门狗每 5 分钟检查常驻进程，挂了自动拉起；登录失效只通知你一次重新扫码
+- 🛡️ **自愈**：纯脚本看门狗每 5 分钟检查常驻进程，挂了自动拉起；登录失效只通知你一次重新扫码；健康时零唤醒、零 token 消耗
 - 🔐 **凭据安全**：登录凭据只存本地 `state/session.json`，目录强制 `.gitignore`，日志与状态输出全部脱敏
 
 ## 快速开始
@@ -31,7 +31,7 @@ nohup python3 bridge.py serve > state/serve.out 2>&1 &
 python3 bridge.py status
 ```
 
-之后：**先在微信里给 Bot 发一条消息**（官方限制，Bot 不能主动开口），再 `python3 bridge.py send --text "你好"` 验证回复链路。自动回复 hook 与看门狗 cron 的配置见 `SKILL.md` 第 5、6 步与 `templates/`。
+之后：**先在微信里给 Bot 发一条消息**（官方限制，Bot 不能主动开口），再 `python3 bridge.py send --text "你好"` 验证回复链路。自动回复 hook 与看门狗 hook 的配置见 `SKILL.md` 第 5、6 步与 `templates/`。
 
 ## 仓库结构
 
@@ -39,8 +39,9 @@ python3 bridge.py status
 SKILL.md                    完整部署与运维手册（给 AI 助手执行）
 scripts/bridge.py           桥本体：login / wait-login / serve / send / status，仅标准库 + qrcode
 scripts/wechat-inbox-watch.sh  自动回复 hook 的轮询脚本
+scripts/wechat-bridge-watchdog.sh  看门狗 hook 的纯脚本检查（自愈＋故障唤醒）
 templates/hook-prompt.md    自动回复 worker 指令模板
-templates/watchdog-cron.md  看门狗 cron 正文模板
+templates/watchdog-hook-prompt.md  看门狗通知 worker 指令模板
 templates/gitignore         安装目录 .gitignore（忽略 state/）
 ```
 

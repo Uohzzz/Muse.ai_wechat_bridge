@@ -1,7 +1,7 @@
 ---
 name: "wechat_ilink_bridge"
 title: "微信 iLink Bot 桥"
-description: "把 AI 助手接入用户微信：走微信官方 iLink / Clawbot Bot 通道（ilinkai.weixin.qq.com），扫码登录后实现一对一私聊的收发、自动回复与健康看门狗。包含 bridge.py（仅 Python 标准库 + qrcode）、inbox/outbox 文件队列、15 秒自动回复 hook 与 5 分钟看门狗 cron 的完整部署流程。"
+description: "把 AI 助手接入用户微信：走微信官方 iLink / Clawbot Bot 通道（ilinkai.weixin.qq.com），扫码登录后实现一对一私聊的收发、自动回复与健康看门狗。包含 bridge.py（仅 Python 标准库 + qrcode）、inbox/outbox 文件队列、15 秒自动回复 hook 与纯脚本看门狗 hook（健康时零唤醒、零 token）的完整部署流程。"
 ---
 
 # 微信 iLink Bot 桥
@@ -12,7 +12,7 @@ description: "把 AI 助手接入用户微信：走微信官方 iLink / Clawbot 
 
 - `bridge.py serve` 常驻进程：用 `getupdates` 长轮询收消息 → 写入 `inbox/`（JSON 文件队列）；把 `outbox/pending/` 里的回复用 `sendmessage` 发出 → 移到 `outbox/sent/`。
 - 自动回复 hook（每 15 秒轮询 `inbox/`）：发现未处理消息就唤醒一个 worker 按助手口吻生成回复、写入 `outbox/pending/`，serve 负责真正发送。
-- 看门狗 cron（每 5 分钟）：检查 serve 存活并自动拉起；发现登录失效标记时通知用户重新扫码（只通知一次）。
+- 看门狗 hook（纯脚本，每 5 分钟）：脚本直接检查 serve 存活并自动拉起、处理登录失效标记，健康时 silent 不唤醒任何 agent（零 token）；只有拉起成功/失败或登录失效时才唤醒通知 worker 给用户发一条消息（登录失效只通知一次）。收件箱轮询发现新消息时顺带刷新 `state/last_activity.json`（用户最后活跃时间），供闲置判断使用。
 - 所有状态都在安装目录的 `state/` 下，其中 `session.json` 是登录凭据。
 
 ## 前置条件
@@ -62,9 +62,12 @@ python3 bridge.py status   # serve: 运行中
 2. **启用前先把当时 inbox 里已有的消息 ID 全部写入 `state/processed.json`（JSON 数组）**，避免重复回复手动测试过的消息。
 3. 用 hook 工具创建 hook：轮询间隔 15 秒，worker 指令用 `templates/hook-prompt.md` 的内容。先 dry-run（预期 silent 或只报已知消息），再 enable。
 
-### 6. 配置看门狗 cron
+### 6. 配置看门狗 hook（纯脚本版，不要用 cron）
 
-用 cron 工具新建 interval 任务：每 5 分钟，标题“微信桥健康看门狗”，正文用 `templates/watchdog-cron.md` 的内容（serve 拉起 + NEEDS_RELOGIN 只通知一次；健康时静默）。
+1. 把 `scripts/wechat-bridge-watchdog.sh` 放到 `~/hooks/scripts/`（脚本自己完成 serve 存活检查、拉起、NEEDS_RELOGIN 标记处理与 watchdog.log 记录；目录可用环境变量 `WECHAT_BRIDGE_DIR` 覆盖，便于沙箱测试）。
+2. 用 hook 工具创建 hook：轮询间隔 300 秒，worker 指令用 `templates/watchdog-hook-prompt.md` 的内容。先 dry-run（健康时预期 silent 并报出 serve pid），再 enable。
+3. 上线前建议在沙箱目录用 stub 版 bridge.py 实测两条故障路径：serve 已挂 → 脚本拉起并 wake（kind=restarted）；存在 NEEDS_RELOGIN 且未通知 → wake（kind=relogin）并生成 notified_relogin 标记，第二次运行应 silent。
+4. 不要再建 cron 版看门狗——cron 每跑一次都要唤醒一个 agent，全天 288 次，是纯浪费；hook 脚本健康时零 token。
 
 ## 协议关键细节（踩过的坑，照做）
 

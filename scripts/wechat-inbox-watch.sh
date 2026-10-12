@@ -43,6 +43,11 @@ if ids:
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(claimed, f, ensure_ascii=False)
     os.replace(tmp, claimed_path)
+    # 活跃时间戳（闲置静默机制用）：用户一说话就刷新，看门狗据此判断闲置时长
+    act_tmp = os.path.join(state, "last_activity.json.tmp")
+    with open(act_tmp, "w", encoding="utf-8") as f:
+        json.dump({"ts": now}, f)
+    os.replace(act_tmp, os.path.join(state, "last_activity.json"))
 print(",".join(ids))
 PYEOF
 )
